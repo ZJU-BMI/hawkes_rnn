@@ -135,7 +135,7 @@ def main(data_length):
     :return:
     """
     feature_path = os.path.abspath('../../resource/预处理后的长期纵向数据_特征.csv')
-    label_path = os.path.abspath('../../resource/preprocessed_label.csv')
+    label_path = os.path.abspath('../../resource/预处理后的长期纵向数据_标签.csv')
     save_root = os.path.abspath('../../resource/rnn_data/')
 
     for j in range(10):

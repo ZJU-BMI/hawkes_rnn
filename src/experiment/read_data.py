@@ -2,10 +2,13 @@
 import os
 import numpy as np
 import random
+import math
+import copy
 
 
 class DataSource(object):
-    def __init__(self, data_folder, data_length, repeat, validate_fold_num, batch_size, event_count=11):
+    def __init__(self, data_folder, data_length, repeat, validate_fold_num, batch_size, event_count=11,
+                 read_fraction=1):
         """
         内部处理使用BTD格式，统一输出TBD数据
         :param data_folder:
@@ -14,19 +17,23 @@ class DataSource(object):
         :param repeat:
         :param batch_size:
         :param event_count:
+        :param read_fraction: 读取原始数据中多少数据
         """
         self.__data_folder = data_folder
         self.__validate_fold_num = validate_fold_num
-        self.__batch_size = batch_size
+        self.__batch_size = int(batch_size)
         self.__data_length = data_length
         self.__repeat = repeat
         self.__event_count = event_count
+        self.__read_fraction = read_fraction
 
         train_feature_list, train_sequence_list, train_label_dict, test_feature_list, test_sequence_length, \
             test_label_dict, validation_feature_list, validation_sequence_length, validation_label_dict = \
             self.__read_data()
         if batch_size >= len(train_feature_list):
-            raise ValueError("Batch Size Too Large")
+            print('\033[1;31m Batch Size Too Large, Data Automatic Augment (Re-Sampling)\033[0m!')
+            train_feature_list, train_sequence_list, train_label_dict = \
+                DataSource.data_augment(batch_size, train_feature_list, train_sequence_list, train_label_dict)
         self.__test_feature = test_feature_list
         self.__test_sequence_length = test_sequence_length
         self.__test_label = test_label_dict
@@ -41,6 +48,57 @@ class DataSource(object):
             self.__shuffle_data()
 
         self.__current_batch_index = 0
+
+    @ staticmethod
+    def data_augment(batch_size, train_feature_list, train_sequence_list, train_label_dict):
+        augment_factor = math.ceil(batch_size/len(train_sequence_list)) * 3
+        augment_feature = list()
+        augment_label = dict()
+        augment_sequence = list()
+        for key in train_label_dict:
+            augment_label[key] = list()
+        for _ in range(augment_factor):
+            augment_feature.append(copy.deepcopy(train_feature_list))
+            augment_sequence.append(copy.deepcopy(train_sequence_list))
+            for key in train_label_dict:
+                augment_label[key].append(copy.deepcopy(train_label_dict[key]))
+        augment_feature = np.concatenate(augment_feature, axis=0)
+        augment_sequence = np.concatenate(augment_sequence, axis=0)
+        for key in augment_label:
+            augment_label[key] = np.concatenate(augment_label[key], axis=0)
+        return augment_feature, augment_sequence, augment_label
+
+    def get_all_data(self, key_name):
+        event_count = self.__event_count
+        train_feature = self.__raw_train_feature
+        train_time = train_feature[:, :, event_count]
+        train_event = np.transpose(train_feature[:, :, 0: event_count], [1, 0, 2])
+        train_context = np.transpose(train_feature[:, :, event_count+1:], [1, 0, 2])
+        train_sequence_length = self.__raw_train_sequence_length
+        train_label = self.__raw_train_label[key_name]
+
+        validate_feature = self.__validation_feature
+        validate_time = validate_feature[:, :, event_count]
+        validate_event = np.transpose(validate_feature[:, :, 0: event_count], [1, 0, 2])
+        validate_context = np.transpose(validate_feature[:, :, event_count+1:], [1, 0, 2])
+        validate_sequence_length = self.__validation_sequence_length
+        validate_label = self.__validation_label[key_name]
+
+        test_feature = self.__test_feature
+        test_time = test_feature[:, :, event_count]
+        test_event = np.transpose(test_feature[:, :, 0: event_count], [1, 0, 2])
+        test_context = np.transpose(test_feature[:, :, event_count+1:], [1, 0, 2])
+        test_sequence_length = self.__test_sequence_length
+        test_label = self.__test_label[key_name]
+
+        event = np.concatenate([train_event, validate_event, test_event], axis=1)
+        context = np.concatenate([train_context, validate_context, test_context], axis=1)
+        sequence_length = np.concatenate([train_sequence_length, validate_sequence_length,
+                                          test_sequence_length], axis=0)
+        time = np.concatenate([train_time, validate_time, test_time], axis=0)
+        label = np.concatenate([train_label, validate_label, test_label])
+
+        return event, context, time, sequence_length, label
 
     def get_validation_label(self, key_name):
         validation_label = self.__validation_label[key_name]
@@ -119,6 +177,8 @@ class DataSource(object):
         data_length = self.__data_length
         data_folder = self.__data_folder
         repeat = self.__repeat
+        fraction = self.__read_fraction
+
         train_feature_list = list()
         train_sequence_list = list()
         validation_feature_list = None
@@ -145,7 +205,7 @@ class DataSource(object):
 
         # 构建event列表
         label_candidate = ['其它', '再血管化手术', '心功能1级', '心功能2级', '心功能3级', '心功能4级', '死亡', '癌症',
-                           '糖尿病入院', '肺病', '肾病入院', '全因']
+                           '糖尿病入院', '肺病', '肾病入院']
         time_candidate = ['三月', '一年']
         event_list = list()
         for item_1 in label_candidate:
@@ -182,13 +242,36 @@ class DataSource(object):
             label_name = 'length_{}_test_{}_label.npy'.format(str(data_length), key_name)
             label = np.load(os.path.join(data_folder, label_name))
             test_label_dict[key_name] = label
-        return train_feature_list, train_sequence_list, train_label_dict, test_feature_list, test_sequence_length, \
-            test_label_dict, validation_feature_list, validation_sequence_length, validation_label_dict
+
+        # 根据fraction改变训练数据集大小，但是不改变测试集和验证集
+        reduced_feature_list = list()
+        reduced_label_list = dict()
+        for key in train_label_dict:
+            reduced_label_list[key] = list()
+        reduced_sequence_list = list()
+        actual_data_size = math.floor(len(train_feature_list)*fraction)
+        shuffle_index = [i for i in range(len(train_feature_list))]
+        random.shuffle(shuffle_index)
+        for i, index in enumerate(shuffle_index):
+            if i >= actual_data_size:
+                break
+            for key in train_label_dict:
+                reduced_label_list[key].append(train_label_dict[key][index])
+            reduced_sequence_list.append(train_sequence_list[index])
+            reduced_feature_list.append(train_feature_list[index])
+        reduced_feature_list = np.array(reduced_feature_list)
+        reduced_sequence_list = np.array(reduced_sequence_list)
+        for key in reduced_label_list:
+            reduced_label_list[key] = np.array(reduced_label_list[key])
+
+        return reduced_feature_list, reduced_sequence_list, reduced_label_list, test_feature_list, \
+            test_sequence_length, test_label_dict, validation_feature_list, validation_sequence_length, \
+            validation_label_dict
 
 
 def unit_test():
     data_folder = os.path.abspath('../../resource/rnn_data')
-    data_length = 20
+    data_length = 10
     test_fold_num = 0
     batch_size = 128
     data_source = DataSource(data_folder, data_length, 8, test_fold_num, batch_size)
@@ -205,6 +288,7 @@ def unit_test():
         data_source.get_validation_feature()
     test_label = data_source.get_test_label('一年肾病入院')
     validation_label = data_source.get_test_label('一年肾病入院')
+    data = data_source.get_all_data('一年肾病入院')
     print(test_event)
     print(test_context)
     print(test_time)
